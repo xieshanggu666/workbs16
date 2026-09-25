@@ -211,6 +211,32 @@ def transaction():
     return _Tx(_conn)
 
 
+class _ReadTx:
+    """WAL 快照读事务（BEGIN 延迟取 SHARED 锁）：读者不阻塞任何写者。
+
+    专供只读接口（协作增量同步等周期性轮询）使用独立连接，避免长耗时只读
+    推演占用单连接写事务、把所有在线动作挡在外面。块内看到的是进入事务时
+    的一致性快照（WAL 下写者提交不影响本事务内的读）。
+    """
+
+    def __enter__(self):
+        self.conn = get_conn()
+        self.conn.execute("BEGIN")
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            # 只读事务提交/回滚等价（释放快照与 SHARED 锁）
+            self.conn.commit() if exc_type is None else self.conn.rollback()
+        finally:
+            self.conn.close()
+        return False
+
+
+def read_transaction():
+    return _ReadTx()
+
+
 class _Tx:
     """对共享单连接加全局锁后开启立即写事务：读写互不交错。
 
@@ -315,21 +341,16 @@ def append_event_conn(conn, run_id, seq, action, payload):
     )
 
 
-def load_events(run_id):
-    """读取动作日志（只读）。
+def load_events_range_conn(conn, run_id, after_seq=0):
+    """事务内读取动作日志中 seq 严格大于 after_seq 的行（增量同步用，按序返回）。
 
-    异常日志兼容：payload_json 损坏（NULL/截断/非法 JSON）的行不抹掉整段回放，
-    返回空 payload 并由回放推演标注为 error（前端仍可跳转其余步骤）。
+    与 load_events 同款的损坏行降级：payload 解析失败标 _corrupt，由回放推演
+    标注 error，不抹掉其余增量帧。
     """
-    with _lock:
-        conn = _conn
-        if conn is None:
-            init_db()
-            conn = _conn
-        rows = conn.execute(
-            "SELECT seq, action, payload_json FROM battle_events WHERE run_id=? ORDER BY seq",
-            (run_id,),
-        ).fetchall()
+    rows = conn.execute(
+        "SELECT seq, action, payload_json FROM battle_events "
+        "WHERE run_id=? AND seq>? ORDER BY seq",
+        (run_id, after_seq or 0)).fetchall()
     out = []
     for r in rows:
         raw = r["payload_json"]
@@ -341,6 +362,21 @@ def load_events(run_id):
             payload = {"_corrupt": True}
         out.append({"seq": r["seq"], "action": r["action"], "payload": payload})
     return out
+
+
+def load_events(run_id):
+    """读取动作日志（只读）。
+
+    异常日志兼容：payload_json 损坏（NULL/截断/非法 JSON）的行不抹掉整段回放，
+    返回空 payload 并由回放推演标注为 error（前端仍可跳转其余步骤）。
+    """
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        events = load_events_range_conn(conn, run_id, 0)
+    return events
 
 
 # ---------- 行动请求幂等 ----------
@@ -417,6 +453,12 @@ def _row_to_expedition(row):
     }
 
 
+def load_expedition_conn(conn, exp_id):
+    """事务内读取远征（含交接快照与 rev）。"""
+    row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+    return None if row is None else _row_to_expedition(row)
+
+
 def load_expedition(exp_id):
     """读取远征（含交接快照）。使用共享连接，读不到未提交数据。"""
     with _lock:
@@ -424,8 +466,7 @@ def load_expedition(exp_id):
         if conn is None:
             init_db()
             conn = _conn
-        row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
-    return None if row is None else _row_to_expedition(row)
+        return load_expedition_conn(conn, exp_id)
 
 
 def save_expedition_conn(conn, exp_id, status, chapter, current_run_id, carry, expected_rev=None):
@@ -494,6 +535,12 @@ def list_expedition_runs(exp_id):
 
 
 # ---------- 独立包装：迁移/测试/运维用（单表原子即可的场景） ----------
+def load_run_conn(conn, run_id):
+    """事务内读取单局（含乐观版本号 rev）。"""
+    row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    return None if row is None else _row_to_run(row)
+
+
 def save_run(run_id, status, position, state):
     with transaction() as conn:
         save_run_run(conn, run_id, status, position, state)
@@ -671,15 +718,12 @@ def append_coop_event_conn(conn, team_id, seq, kind, payload):
     )
 
 
-def load_coop_events(team_id):
-    with _lock:
-        conn = _conn
-        if conn is None:
-            init_db()
-            conn = _conn
-        rows = conn.execute(
-            "SELECT seq, kind, payload_json FROM coop_events WHERE team_id=? ORDER BY seq",
-            (team_id,)).fetchall()
+def load_coop_events_conn(conn, team_id, after_seq=0):
+    """事务内读取队伍时间线；after_seq>0 时仅返回 seq 严格大于它的事件（增量游标）。
+    损坏行降级为 _corrupt，不拖垮整程回放。"""
+    rows = conn.execute(
+        "SELECT seq, kind, payload_json FROM coop_events WHERE team_id=? AND seq>? ORDER BY seq",
+        (team_id, after_seq or 0)).fetchall()
     out = []
     for r in rows:
         raw = r["payload_json"]
@@ -691,6 +735,17 @@ def load_coop_events(team_id):
             payload = {"_corrupt": True}
         out.append({"seq": r["seq"], "kind": r["kind"], "payload": payload})
     return out
+
+
+def load_coop_events(team_id, after_seq=0):
+    """读取队伍时间线（只读）；after_seq>0 时仅返回 seq 严格大于它的事件（增量同步游标）。
+    损坏行降级为 _corrupt，不拖垮整程回放。"""
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        return load_coop_events_conn(conn, team_id, after_seq=after_seq)
 
 
 def next_ledger_seq_conn(conn, team_id):

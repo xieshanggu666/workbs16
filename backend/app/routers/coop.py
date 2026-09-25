@@ -11,7 +11,8 @@ from fastapi import APIRouter, HTTPException
 
 from .. import service
 from ..schemas import (AdvanceRequest, AssignRoleRequest, CoopAdvanceRequest,
-                       CoopMemberRequest, CreateCoopTeamRequest, JoinCoopTeamRequest)
+                       CoopMemberRequest, CoopSyncRequest, CreateCoopTeamRequest,
+                       JoinCoopTeamRequest)
 
 router = APIRouter(prefix="/api/coop", tags=["coop"])
 
@@ -103,6 +104,17 @@ def get_team_expedition(team_id: str, member_id: str | None = None):
         return service.get_coop_expedition(team_id, member_id=member_id)
     except service.InvalidAction as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/teams/{team_id}/sync")
+def sync_team(team_id: str, body: CoopSyncRequest):
+    """断线重连 / 事件增量同步：成员鉴权 + 服务端游标，回时间线增量、动作帧
+    增量（与整局回放同构、逐位校验）与权威快照；游标失效时 reset 全量对齐。"""
+    try:
+        cursor = body.cursor.model_dump() if body.cursor is not None else None
+        return service.coop_sync(team_id, body.member_id, cursor=cursor)
+    except Exception as e:  # 权限 403 / 队伍不存在 400 统一映射
+        _http_error(e)
 
 
 @router.get("/teams/{team_id}/replay")

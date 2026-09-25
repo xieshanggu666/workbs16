@@ -1,9 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { useStore } from '../store'
+import { useCoopSync } from '../coopSync'
 
 // 协作远征侧栏：队伍成员、各自角色、个人贡献/战利，以及“我”的权限提示。
-// 大厅轮询同款轻量刷新（只在协作远征中挂载），让各成员看到彼此的最新状态。
+// 2.10.0：数据来自断线重连/增量同步循环（与章节帧同一条服务端游标通道）：
+// 首次挂载拉一次完整队伍视口（含 ledger），之后把 sync 推来的时间线增量合并，
+// 不再独立轮询——成员列表/角色在开赛后不变，贡献数随同步结果轻量刷新。
 const ROLE_ICON = { leader: '👑', combat: '⚔️', supply: '🎒' }
 const ROLE_NAME = { leader: '队长', combat: '战斗位', supply: '资源位' }
 
@@ -12,31 +15,38 @@ export default function CoopPanel() {
   const runId = useStore((s) => s.runId)
   const [team, setTeam] = useState(null)
   const [err, setErr] = useState('')
-  const timer = useRef(null)
+  const teamEvents = useCoopSync((s) => s.teamEvents)
+  const connected = useCoopSync((s) => s.connected)
+  const inflight = useCoopSync((s) => s.inflight)
 
   const coop = view?.coop
   const teamId = coop?.team_id
   const meId = coop?.me?.id
+  const pollGuard = useRef(0)
 
+  // 进入协作章节/换章：拉一次完整队伍视口（成员 + 个人战利 ledger）
   useEffect(() => {
     if (!teamId) {
       setTeam(null)
       return () => {}
     }
     let alive = true
-    async function load() {
-      try {
-        const data = await api.getCoopTeam(teamId, meId)
-        if (alive) setTeam(data)
-      } catch (e) {
-        if (alive) setErr(e.message)
-      }
-    }
-    load()
-    // 协作中低频同步成员列表/贡献（权威章节状态仍由动作响应与手动刷新驱动）
-    timer.current = setInterval(load, 5000)
-    return () => { alive = false; clearInterval(timer.current) }
+    api.getCoopTeam(teamId, meId)
+      .then((data) => { if (alive) setTeam(data) })
+      .catch((e) => { if (alive) setErr(e.message) })
+    return () => { alive = false }
   }, [teamId, meId, runId])
+
+  // 同步循环推来结算类时间线（chapter_clear/settle）时刷新一次贡献/战利汇总
+  const hasSettlement = (teamEvents || []).some(
+    (e) => ['chapter_clear', 'settle', 'advance'].includes(e.kind))
+  useEffect(() => {
+    if (!teamId || !connected || !hasSettlement) return
+    const guard = ++pollGuard.current
+    api.getCoopTeam(teamId, meId)
+      .then((data) => { if (guard === pollGuard.current) setTeam(data) })
+      .catch(() => {})
+  }, [teamId, meId, connected, hasSettlement, inflight])
 
   if (!coop) return null
   const members = team?.members || coop.members

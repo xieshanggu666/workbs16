@@ -55,6 +55,8 @@ def resume(run_id: str, member_id: str | None = None):
 @router.get("/{run_id}/replay")
 def replay(run_id: str):
     try:
-        return service.replay(run_id)
+        rep = service.replay(run_id)
+        rep.pop("_internal", None)
+        return rep
     except service.InvalidAction as e:
         raise HTTPException(status_code=400, detail=str(e))

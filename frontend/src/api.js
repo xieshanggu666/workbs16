@@ -14,6 +14,21 @@ export function setExpectedRev(rev) {
   if (Number.isInteger(rev)) expectedRev = rev
 }
 
+// 协作增量同步在 409 冲突恢复后拿到权威 rev：由同步模块显式设置，避免同步
+// 循环与用户动作的乐观版本互相覆盖。
+export function syncExpectedRev(rev) {
+  if (Number.isInteger(rev)) expectedRev = rev
+}
+
+// 409 冲突/换会话时清掉本地乐观版本（后续请求不再带旧值，直到权威快照重新建立）
+export function resetExpectedRev() {
+  expectedRev = null
+}
+
+export function getExpectedRev() {
+  return expectedRev
+}
+
 export function setCurrentMemberId(id) {
   currentMemberId = id || null
 }
@@ -39,6 +54,20 @@ export class ForbiddenError extends Error {
 }
 
 let reqSeq = 0
+
+// 协作同步模块注册的「本地动作已提交」钩子（见 coopSync.noteLocalStep）。
+// 避免 api 层直接依赖 zustand 存储造成循环引用。
+let localStepHook = null
+export function setLocalStepHook(fn) {
+  localStepHook = typeof fn === 'function' ? fn : null
+}
+
+// 协作 409 冲突恢复钩子（coopSync.recoverFromConflict），同样经注入避免循环依赖
+let coopRecoverHook = null
+export function setCoopRecoverHook(fn) {
+  coopRecoverHook = typeof fn === 'function' ? fn : null
+}
+
 function newRequestId() {
   reqSeq += 1
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -111,6 +140,11 @@ export const api = {
     try {
       const data = await j(`${BASE}/runs/${id}/act`, { method: 'POST', body: JSON.stringify(body) })
       if (Number.isInteger(data.rev)) expectedRev = data.rev
+      // 协作增量同步：自己成功提交后乐观推进本地游标（seq/rev 均取自服务端响应，
+      // 不本地臆造）；下个同步周期若与服务端不一致会被 reset 全量对齐
+      if (data.seq && currentMemberId && localStepHook) {
+        localStepHook({ runId: id, seq: data.seq, rev: data.rev })
+      }
       return data
     } catch (e) {
       // 状态冲突：版本号已失效，清掉避免后续请求继续带旧值；调用方应刷新续局
@@ -171,14 +205,36 @@ export const api = {
     }),
   getCoopExpedition: (teamId, memberId = currentMemberId) =>
     j(`${BASE}/coop/teams/${teamId}/expedition${memberId ? `?member_id=${encodeURIComponent(memberId)}` : ''}`),
+  // 断线重连 / 事件增量同步：成员鉴权 + 服务端游标，回时间线增量、动作帧增量
+  // （与整局回放同构、逐位校验）与权威快照；游标失效时服务端回 reset 全量对齐。
+  coopSync: (teamId, cursor, memberId = currentMemberId) =>
+    j(`${BASE}/coop/teams/${teamId}/sync`, {
+      method: 'POST',
+      body: JSON.stringify({ member_id: memberId, cursor: cursor || null }),
+    }),
   coopTeamReplay: (teamId) => j(`${BASE}/coop/teams/${teamId}/replay`),
 }
 
 // 统一的行动错误处理：遇到 409（重复请求/状态冲突）自动拉取最新视口对齐，
 // 返回可展示给用户的提示语。refresh 为最新视口应用函数（通常是 applyRun）。
 // 403（协作权限边界）不刷新——刷新不会改变角色授权，直接把原因返回给调用方。
-export async function handleActError(e, runId, refresh) {
+//
+// 协作章节（options.coop = {teamId, memberId}）：409 后优先走服务端游标增量
+// 同步——断线期间队友的动作以回放帧局部重放补齐（逐帧一致），游标失效则整体
+// 落权威快照；非协作场景保持旧的整视口 resume 行为。
+export async function handleActError(e, runId, refresh, options = {}) {
   if (e instanceof ConflictError) {
+    if (options.coop?.teamId && options.coop.memberId) {
+      // 走服务端游标增量同步：队友动作以回放帧局部重放补齐（逐帧一致），游标
+      // 失效则整体落权威快照。经 setRecoverHook 注入，避免 api↔coopSync 循环依赖。
+      if (coopRecoverHook) {
+        return coopRecoverHook({
+          teamId: options.coop.teamId,
+          memberId: options.coop.memberId,
+          applyRun: refresh,
+        })
+      }
+    }
     try {
       const fresh = await api.resume(runId)
       if (refresh) refresh(fresh)

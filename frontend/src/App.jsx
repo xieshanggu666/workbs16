@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from 'react'
-import { api } from './api'
+import { api, handleActError, setCurrentMemberId } from './api'
 import { useStore } from './store'
+import { coopRecoverOpts } from './useCoopRecover'
+import {
+  useCoopSync, coopSyncLoop, rememberSession,
+  forgetSession, resetCursor,
+} from './coopSync'
 import MapView from './components/MapView.jsx'
 import BattleView from './components/BattleView.jsx'
 import RewardView from './components/RewardView.jsx'
@@ -17,6 +22,7 @@ import ExpeditionReplay from './components/ExpeditionReplay.jsx'
 import CoopLobby from './components/CoopLobby.jsx'
 import CoopPanel from './components/CoopPanel.jsx'
 import CoopReplay from './components/CoopReplay.jsx'
+import CoopConnBadge from './components/CoopConnBadge.jsx'
 
 export default function App() {
   const { view, setCards, cards, runId, setRunId, applyRun } = useStore()
@@ -37,9 +43,43 @@ export default function App() {
   const [coopReplayId, setCoopReplayId] = useState(null)
   const [coopTeamId, setCoopTeamId] = useState('')
 
+  // 协作增量同步的连接状态（断线/重连/补播提示）
+  const coopConn = useCoopSync()
+
   useEffect(() => {
     api.cards().then(setCards).catch(() => {})
   }, [])
+
+  // 协作章节中：以当前 run 的 coop 身份启动服务端游标同步循环（断线自动重连、
+  // 队友动作增量帧局部重放）；离开协作 run（新局/回大厅/换队）即停止。
+  const coopTeamNow = view?.coop?.team_id
+  const coopMeNow = view?.coop?.me?.id
+  useEffect(() => {
+    if (!coopTeamNow || !coopMeNow || !runId) return undefined
+    rememberSession({
+      teamId: coopTeamNow,
+      teamName: view?.coop?.name,
+      memberId: coopMeNow,
+      memberName: view?.coop?.me?.name,
+      role: view?.coop?.me?.role,
+    })
+    coopSyncLoop.start({
+      teamId: coopTeamNow,
+      memberId: coopMeNow,
+      applyRun,
+      resetView: (snap) => { setRunId(snap.run_id); setReplayId(null) },
+    })
+    return () => coopSyncLoop.stop()
+    // 只随「进入/离开协作章节」与 run 切换重挂循环；view 高频变化不重启轮询
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coopTeamNow, coopMeNow, runId])
+
+  // 提示语自动消失
+  useEffect(() => {
+    if (!coopConn.note) return undefined
+    const t = setTimeout(() => useCoopSync.setState({ note: '' }), 4000)
+    return () => clearTimeout(t)
+  }, [coopConn.note])
 
   // 切换到不同节点（进商店/离开商店/续局）时重置商店面板的本地收起状态
   useEffect(() => {
@@ -120,13 +160,18 @@ export default function App() {
     setLoading(true); setErr('')
     try {
       // 协作远征走队伍推进接口（服务端校验仅队长可操作）；单人远征走原接口
-      const coopTeamId = view?.coop?.team_id
-      if (coopTeamId) setCoopTeamId(coopTeamId)
-      const data = coopTeamId
-        ? await api.advanceCoopExpedition(coopTeamId)
+      const teamId = view?.coop?.team_id
+      if (teamId) setCoopTeamId(teamId)
+      const data = teamId
+        ? await api.advanceCoopExpedition(teamId)
         : await api.advanceExpedition(expeditionId)
+      if (teamId) {
+        // 换章：旧游标指向上一章 run，主动作废让同步循环走全量快照对齐
+        resetCursor()
+      }
       applyRun(data.run)
       setRunId(data.run.run_id)
+      if (teamId) coopSyncLoop.restart()
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -137,6 +182,8 @@ export default function App() {
   function enterCoopRun(team, runView = null) {
     setShowCoop(false)
     setCoopTeamId(team.id)
+    // 进入协作章节：游标作废，由同步循环首次 sync 走全量快照对齐（断线重连同理）
+    resetCursor()
     if (runView) {
       applyRun(runView)
       setRunId(runView.run_id)
@@ -166,8 +213,38 @@ export default function App() {
     }
   }
 
+  // 断线重连：从本地持久化的协作会话一键回到队伍当前章节（游标置空 ->
+  // 同步循环首次 sync 走全量权威快照，之后恢复增量）
+  async function reconnectCoopSession() {
+    const s = coopConn.session
+    if (!s?.teamId || !s?.memberId) return
+    setLoading(true); setErr('')
+    try {
+      setCurrentMemberId(s.memberId)
+      const data = await api.getCoopExpedition(s.teamId, s.memberId)
+      setCoopTeamId(s.teamId)
+      if (data.run) {
+        resetCursor()
+        applyRun(data.run)
+        setRunId(data.run.run_id)
+        setShowCoop(false)
+      } else {
+        setShowCoop(true)
+      }
+    } catch (e) {
+      setErr(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function leaveCoopSession() {
+    forgetSession()
+  }
+
   async function newRun() {
     setErr('')
+    coopSyncLoop.stop()
     const run = await api.createRun()
     applyRun(run)
     setRunId(run.run_id)
@@ -181,7 +258,7 @@ export default function App() {
       const res = await api.act(runId, { action: 'commission_claim', commission: cid })
       applyRun(res.run)
     } catch (e) {
-      setErr(e.message)
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setLoading(false)
     }
@@ -213,6 +290,21 @@ export default function App() {
               👥 多人协作远征（组队 · 角色分工 · 共享章节）
             </button>
           </div>
+          {coopConn.session && (
+            <div className="coop-reconnect-entry panel-inner">
+              <span>
+                🔌 检测到协作远征会话：{coopConn.session.memberName || '队员'}
+                {coopConn.session.teamName ? ` · ${coopConn.session.teamName}` : ''}
+              </span>
+              <button className="primary" onClick={reconnectCoopSession} disabled={loading}>
+                断线重连
+              </button>
+              <button onClick={leaveCoopSession} disabled={loading}
+                      title="忘记本机保存的队员会话（不退队、不影响其他成员）">
+                清除
+              </button>
+            </div>
+          )}
           <div className="fieldrow">
             <span>远征 ID</span>
             <input value={expId} onChange={(e) => setExpId(e.target.value)} placeholder="粘贴 expedition_id" />
@@ -279,6 +371,7 @@ export default function App() {
             {view.coop.me && <> · {view.coop.me.icon} {view.coop.me.role_label}</>}
           </span>
         )}
+        {view.coop && <CoopConnBadge />}
         <span>生命 {view.health}/{view.max_health}</span>
         <span>金币 {view.gold}</span>
         <span>牌组 {view.deck.length}</span>

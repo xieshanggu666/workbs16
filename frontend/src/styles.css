@@ -544,6 +544,29 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 
 /* 协作侧栏 */
 .coop-chip { background: #1d2f29; color: #9fe8c8; border-color: #3f7a64; }
+
+/* 协作断线重连 / 增量同步连接徽标（2.10.0） */
+.coop-conn { display: inline-flex; align-items: center; gap: 6px; }
+.coop-conn-btn {
+  background: transparent; border: 0; color: inherit; font: inherit;
+  cursor: pointer; padding: 0; white-space: nowrap;
+}
+.coop-conn.ok .coop-conn-btn { color: #9fe8c8; }
+.coop-conn.syncing, .coop-conn.catchup { background: #332f1c; color: #ecd58a; border-color: #6f653f; }
+.coop-conn.offline { background: #3a2323; color: #ff9d8a; border-color: #7a4038; }
+.coop-conn-note, .coop-conn-err {
+  font-style: normal; font-size: 11px; border-radius: 6px; padding: 1px 7px;
+}
+.coop-conn-note { background: #1d2f29; color: #9fe8c8; }
+.coop-conn-err { background: #3a2323; color: #ff9d8a; }
+.coop-reconnect-entry {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  width: 100%; margin: 4px 0; padding: 8px 10px;
+  background: #1d2823; border: 1px solid #3f7a64; border-radius: 10px;
+  font-size: 13px; color: #b8c7c0;
+}
+.coop-reconnect-entry button { padding: 4px 12px; }
+.panel-inner { box-sizing: border-box; }
 .panellist.coop-panel { border-left: 3px solid #3f7a64; }
 .coop-me-perm { font-size: 12px; color: #b8c7c0; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
 .coop-perm-tags { display: flex; gap: 6px; }

@@ -49,6 +49,19 @@
   逐章可交互回放（每帧标注操作者）由 `GET /api/coop/teams/{id}/replay` 提供，
   全程只读隔离。run 状态新增 `coop_team`（进入交接快照；旧档首次载入补 None，
   回放按 16 种字段形状候选兼容 2.9.0 之前的校验点），单人远征行为完全不变。
+- **断线重连与事件增量同步（规则 2.10.0）**：协作章节中客户端持有服务端复合游标
+  `{team_seq, run_id, run_seq, rev}`，经 `POST /api/coop/teams/{id}/sync`（与写动作
+  同级的成员硬鉴权，越权 403）周期性/`online` 事件/409 冲突后拉取增量：
+  队伍时间线增量（form/join/role/start/chapter_clear/settle）+ 当前章节动作日志
+  游标之后的**动作帧增量**。增量帧由服务端沿**整局回放同一条纯推演内核**重放产生
+  （同一 `_apply_action`、逐位 `ckpt` 校验、同一 legacy/迁移处理），断线期间队友的
+  每一步在前端**局部重放**（战斗帧结算事件经 battleBus 按序播放，逐帧落视口，最后以
+  权威快照校正），保证权限边界、共享状态与整局回放**逐帧一致**。游标失效（首次同步/
+  换章 `run_changed`/seq 缺口 `gap`/`rev` 漂移且无帧可追）时服务端回 `reset:true` +
+  全量权威快照与 `reset_reason`，客户端整体对齐、绝不基于过期本地状态分叉；409
+  （`expected_rev` 过期）自动按游标追平后再提示重试。同步全程只读（不写存档/日志/
+  解锁，前后 rev 与日志行数不变）。本地会话（team_id/member_id）持久化，刷新/关页后
+  一键断线重连（游标不持久化，重连先走全量快照）。
 - **战斗演出**：Phaser 场景按服务端结算顺序逐条播放（待机/攻击/受击/死亡动画、护盾与状态实时刷新），
   播放期间操作锁定，播完再应用权威快照同步血量/护盾/手牌，战斗结束衔接领奖
 - 服务端权威校验行动，防作弊；失败解锁新卡
@@ -145,7 +158,13 @@ flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/�
 入 ledger、战败整队 lost 且 settle 只一次、非队长推进 403 而队长推进继承队伍与协作金、
 金币不足锻造 400 整体回退、合法两角色行动流程逐章/整程回放校验点零 mismatch 且每步带
 操作者、第 2 章从 carry（含 coop_team）重建校验一致、协作视口携带权限边界、单人远征
-携带 member_id 行为不变）**。
+携带 member_id 行为不变）**、
+**断线重连与事件增量同步 2.10.0（复合游标 team_seq/run_id/run_seq/rev、首次同步全量
+reset、队友动作仅回游标之后的增量帧且逐帧 check=ok 与在线 act 视口逐位一致、断线窗口
+多动作一次补齐、战斗帧带结算事件供局部重放、帧 view 逐帧 rev 与请求者 coop 权限摘要、
+换章 run_changed/伪造未来 seq gap/rev 漂移 reset 全量对齐与 reset_reason、409 后自动
+增量追平再重试、非成员 sync 403 与未开赛仅大厅视口、同步只读 rev/日志行数不变、
+换章后观战方 reset 到新章快照且时间线含 chapter_clear、本地会话持久化一键重连）**。
 
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
@@ -191,6 +210,14 @@ flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/�
 - `GET  /api/coop/teams/{id}/expedition?member_id=` 协作远征续局：队伍 + 当前章节 run
   视口（`run.coop` 含成员/角色/本成员权限/奖励常量）。
 - `POST /api/coop/teams/{id}/advance {member_id, request_id?}` 仅队长推进章节（非队长 403）。
+- `POST /api/coop/teams/{id}/sync {member_id, cursor?}` **断线重连/事件增量同步**
+  （2.10.0，成员硬鉴权 403；全程只读）。cursor=`{team_seq, run_id, run_seq, rev}`，
+  省略或首次同步回 `reset:true` + 全量权威 `snapshot`。正常增量回
+  `{team_events[], steps[]（游标之后的动作帧，与 /replay 帧同构：events 战斗结算事件、
+  view 帧视口带逐帧 rev 与请求者 coop 权限摘要、check 逐位校验）, snapshot（权威终态，
+  带真实 rev）, verification, rev, cursor}`；换章（`run_changed`）、seq 缺口（`gap`）、
+  rev 漂移无帧可追（`rev_drift`）回 `reset:true` + `reset_reason` 全量对齐。前端周期性
+  轮询 + `online` 事件重连 + 409 后自动 sync，对 steps 做局部重放（战斗帧按序播动画）。
 - `GET  /api/coop/teams/{id}/replay` 协作整程回放：队伍时间线 + `ledger` 个人流水 +
   远征事件 + 逐章可交互回放（每步 `actor` 为操作者），全程只读。
 - 协作章节 run 的行动仍走 `POST /api/runs/{id}/act`，请求体额外带 `member_id`；

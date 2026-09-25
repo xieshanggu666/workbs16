@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react'
 import { api, handleActError } from '../api'
+import { coopRecoverOpts } from '../useCoopRecover'
 import { useStore } from '../store'
 import { growthNodesOf, growthTag, growthName } from '../growth'
 import { canDoSupply } from '../coopPerms'
@@ -47,7 +48,7 @@ export default function ForgeView({ view }) {
       applyRun(res.run)
       // 该锻造节点已消耗：服务端会关闭面板，本地保留选中即可
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setBusy(false)
     }

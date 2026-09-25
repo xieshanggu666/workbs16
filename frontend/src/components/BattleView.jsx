@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, handleActError } from '../api'
+import { coopRecoverOpts } from '../useCoopRecover'
 import { useStore } from '../store'
 import { bus } from '../phaser/battleBus'
 import { startPhaser, STATUS_ZH } from '../phaser/BattleScene.js'
@@ -70,7 +71,7 @@ export default function BattleView({ view }) {
       await playLog(entries)
       applyRun(res.run)
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setBusy(false)
     }
@@ -87,7 +88,7 @@ export default function BattleView({ view }) {
       await playLog(entries)
       applyRun(res.run)
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setBusy(false)
     }

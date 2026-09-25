@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
+import { coopRecoverOpts } from '../useCoopRecover'
 import { useStore } from '../store'
 import { canDoSupply } from '../coopPerms'
 import PotionBelt from './PotionBelt.jsx'
@@ -31,7 +32,7 @@ export default function RewardView({ view }) {
       applyRun(res.run)
       setReplaceIdx(null)
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setBusy(false)
     }

@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
+import { coopRecoverOpts } from '../useCoopRecover'
 import { useStore } from '../store'
 import { canDoSupply } from '../coopPerms'
 
@@ -39,7 +40,7 @@ export default function CommissionPanel() {
       const res = await api.act(runId, { action: 'commission_claim', commission: q.id })
       applyRun(res.run)
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setBusyId(null)
     }

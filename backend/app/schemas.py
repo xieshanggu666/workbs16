@@ -69,3 +69,19 @@ class AssignRoleRequest(CoopMemberRequest):
 
 class CoopAdvanceRequest(CoopMemberRequest):
     pass
+
+
+class CoopCursor(BaseModel):
+    # 队伍时间线已见最大 seq
+    team_seq: Optional[int] = 0
+    # 客户端当前章节 run 与其动作日志已见最大 seq
+    run_id: Optional[str] = None
+    run_seq: Optional[int] = 0
+    # 客户端视口所依据的存档 rev（用于检出漂移并回全量快照恢复）
+    rev: Optional[int] = None
+
+
+class CoopSyncRequest(BaseModel):
+    """断线重连 / 增量同步：成员身份 + 上次同步到的服务端游标（缺省=首次全量）。"""
+    member_id: str
+    cursor: Optional[CoopCursor] = None

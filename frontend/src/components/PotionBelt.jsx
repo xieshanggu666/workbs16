@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
+import { coopRecoverOpts } from '../useCoopRecover'
 import { useStore } from '../store'
 import { canDoBattle, canDoSupply } from '../coopPerms'
 
@@ -35,7 +36,7 @@ export default function PotionBelt({ inBattle = false, busy = false, onUsed = nu
       applyRun(res.run)
       onUsed?.(res)
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setLocalBusy(false)
     }

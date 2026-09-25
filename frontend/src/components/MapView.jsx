@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
+import { coopRecoverOpts } from '../useCoopRecover'
 import { useStore } from '../store'
 import { canDoSupply, permHint } from '../coopPerms'
 
@@ -34,7 +35,7 @@ export default function MapView({ view }) {
       const res = await api.act(runId, { action: 'choose_node', node })
       applyRun(res.run)
     } catch (e) {
-      setErr(await handleActError(e, runId, applyRun))
+      setErr(await handleActError(e, runId, applyRun, coopRecoverOpts(view)))
     } finally {
       setBusy(false)
     }

@@ -919,6 +919,7 @@ def expedition_replay(exp_id):
     chapters = []
     for r in db.list_expedition_runs(exp_id):
         rep = replay(r["run_id"])
+        rep.pop("_internal", None)
         chapters.append({
             "chapter": r["chapter"],
             "run_id": r["run_id"],
@@ -1317,6 +1318,187 @@ def get_coop_expedition(team_id, member_id=None):
         # 事务已提交：resume 走它自己的迁移事务（coop 摘要在其中构造）
         run_view = resume(current_run_id, member_id=member_id)
         return {"team": team_view, "expedition": expedition_view, "run": run_view}
+
+
+# ---------- 断线重连 / 事件增量同步（2.10.0） ----------
+def _delta_steps_conn(conn, rec, events, after_seq, coop_view):
+    """纯内存重放整章日志，切出 seq>after_seq 的增量帧（不访问数据库）。
+
+    conn 参数保留签名兼容（可为 None）：所有输入已由调用方在读事务里取好，
+    本函数只做只读纯推演，可安全在事务外执行（不阻塞任何在线写动作）。
+
+    增量帧与整局回放共用 _replay_core（同一 _apply_action 纯推演、同一逐位
+    校验点、同一 legacy/迁移处理），保证断线期间队友提交的动作在各成员客户端
+    局部重放时逐帧一致。只重放一次：帧的 view 在内核中已构造完毕。
+    """
+    rep = _replay_core(rec, events)
+    internal = rep.pop("_internal", None) or {}
+    checks_by_seq = {c["seq"]: c for c in (internal.get("checks") or [])}
+    steps = [s for s in rep["steps"] if s["seq"] > after_seq and s["action"] != "create"]
+    # rev 与动作 seq 在建局后一一对应（create seq=1/rev=1，之后每步各 +1）；
+    # 续局迁移只顶高 rev 不追加日志会打破对应——此时帧视图不写 rev，由 sync
+    # 上层的全量快照路径以真实 rev 对齐，避免把推算出的错误版本交给客户端。
+    rev_aligned = (rec["rev"] == max((e["seq"] for e in events), default=1))
+    for s in steps:
+        # 协作章节：每帧叠加当前成员视角的协作摘要（权限边界/在线成员）
+        if coop_view is not None:
+            s["view"]["coop"] = coop_view
+        if rev_aligned:
+            s["view"]["rev"] = s["seq"]
+    verification = {
+        "ok": sum(1 for c in checks_by_seq.values() if c["status"] == "ok"),
+        "legacy": sum(1 for c in checks_by_seq.values() if c["status"] == "legacy"),
+        "mismatch": sum(1 for c in checks_by_seq.values() if c["status"] == "mismatch"),
+        "error": sum(1 for c in checks_by_seq.values() if c["status"] == "error"),
+        "final_match": bool(internal.get("final_match")),
+    }
+    return steps, verification
+
+
+def coop_sync(team_id, member_id, cursor=None):
+    """协作远征断线重连 / 事件增量同步（只读）。
+
+    游标 cursor = {team_seq, run_id, run_seq, rev}：
+    - team_seq：客户端已见过的队伍时间线最大 seq（form/join/role/start/
+      chapter_clear/settle 等）；服务端只回其后的增量事件；
+    - run_id + run_seq：客户端当前章节 run 及其已见过的动作日志最大 seq；
+    - rev：客户端视口所依据的存档乐观版本。
+
+    三类返回：
+    1. 未开赛/已解散：只回队伍视口与时间线增量（run 为 None）；
+    2. reset=true（首次同步无游标/换章 run 已变/日志 seq 缺口/rev 漂移且无新帧
+       可追）：回权威全量 run 视口，客户端直接落快照——这是冲突恢复路径，
+       保证共享状态永远以服务端已提交事务为准；
+    3. 正常增量：回 run_seq 之后的动作帧（与整局回放同构、逐位校验），客户端
+       对这些帧做局部重放（战斗帧经动画队列按序播放），最后一帧 view 即权威
+       终态，另附快照供无动画/越帧场景直接对齐。
+
+    鉴权与写动作同级：member_id 必须属于该队伍（403），不存在队伍 400。
+    全程只读：不写存档/日志/解锁（回放内核 grant_unlocks=False）。
+    """
+    cursor = cursor or {}
+    try:
+        team_seq0 = int(cursor.get("team_seq") or 0)
+    except (TypeError, ValueError):
+        team_seq0 = 0
+    try:
+        run_seq0 = int(cursor.get("run_seq") or 0)
+    except (TypeError, ValueError):
+        run_seq0 = 0
+    cur_run_id = cursor.get("run_id") or None
+    try:
+        cur_rev = int(cursor["rev"]) if cursor.get("rev") is not None else None
+    except (TypeError, ValueError):
+        cur_rev = None
+
+    with db.read_transaction() as conn:
+        team = db.load_coop_team_conn(conn, team_id)
+        if team is None:
+            raise InvalidAction("team not found")
+        # 同步接口携带成员的最新协作状态：与写动作同级的硬鉴权（非大厅只读）
+        member = _require_team_member_conn(conn, team_id, member_id)
+        team_events = [
+            {"seq": e["seq"], "kind": e["kind"], "payload": e["payload"]}
+            for e in db.load_coop_events_conn(conn, team_id, after_seq=team_seq0)
+        ]
+        team_view = _team_view_conn(conn, team, me_id=member_id, with_ledger=False)
+        next_team_seq = db.next_coop_seq_conn(conn, team_id) - 1
+
+        # 未开赛 / 已解散：没有共享章节状态可同步
+        if not team.get("expedition_id") or team["status"] == "disbanded":
+            return {
+                "reset": False, "changed": bool(team_events),
+                "team": team_view, "team_events": team_events,
+                "run": None, "run_changed": False,
+                "steps": [], "snapshot": None,
+                "verification": None, "rev": None,
+                "cursor": {"team_seq": next_team_seq, "run_id": None,
+                           "run_seq": 0, "rev": None},
+            }
+
+        exp = db.load_expedition_conn(conn, team["expedition_id"])
+        if exp is None:
+            raise InvalidAction("expedition not found")
+        run_id = exp["current_run_id"]
+        rec = db.load_run_conn(conn, run_id)
+        if rec is None:
+            raise InvalidAction("run not found")
+        events = db.load_events_range_conn(conn, run_id, after_seq=0)
+        members = db.list_coop_members_conn(conn, team_id)
+        # rec/state/map 均为 JSON 反序列化副本，事务释放后仍可安全纯推演
+        exp_badge = _exp_badge(exp)
+        chapter_info = (exp["chapter"], exp["chapters_total"], exp["status"])
+
+    # ---- 事务外：纯内存只读重放（不持任何 DB 锁，不阻塞在线动作提交） ----
+    max_seq = max((e["seq"] for e in events), default=0)
+    coop_view = coop_mod.coop_badge(team, members, chapter_info[0],
+                                    chapter_info[1], chapter_info[2], me_id=member_id)
+
+    new_cursor = {"team_seq": next_team_seq, "run_id": run_id,
+                  "run_seq": max_seq, "rev": rec["rev"]}
+
+    def _sync_response(reset=False, reason=None, run_changed=False,
+                       steps=None, snapshot=None, verification=None,
+                       changed=None):
+        return {
+            "reset": reset,
+            "reset_reason": reason,
+            # changed 缺省：reset/有增量帧/有新队伍事件都算有变化
+            "changed": (reset if changed is None else changed)
+                       or bool(steps or team_events),
+            "team": team_view, "team_events": team_events,
+            "run": {"id": run_id, "chapter": rec.get("chapter"),
+                    "status": rec["status"]},
+            "run_changed": run_changed,
+            "steps": steps or [],
+            "snapshot": snapshot,
+            "verification": verification,
+            "cursor": new_cursor,
+            # rev 始终在顶层冗余一份：客户端冲突恢复/下次 act 以它为准
+            "rev": rec["rev"],
+        }
+
+    # ---- 冲突恢复判定：游标无法在当前 run 上连续追赶 -> 全量快照 ----
+    run_changed = bool(cur_run_id and cur_run_id != run_id)
+    first_sync = not cur_run_id
+    # 游标声称的已见位置落后于服务端最新动作，但切片却取不到增量帧
+    # （伪造/乱序 seq、日志被外部裁剪）：无法保证连续逐帧，交回全量
+    # 快照由客户端整体对齐；run_seq0>max_seq（游标“来自未来”）同样重置。
+    gap = bool(cur_run_id == run_id and run_seq0 and run_seq0 != max_seq
+               and not any(e["seq"] == run_seq0 for e in events))
+    snapshot_now = lambda: _public_view(
+        rec["state"], rec["map"], run_id, expedition=exp_badge,
+        coop=coop_view, rev=rec["rev"])
+    if first_sync or run_changed or gap:
+        return _sync_response(
+            reset=True,
+            reason=("run_changed" if run_changed else
+                    "gap" if gap else "first_sync"),
+            run_changed=run_changed, snapshot=snapshot_now())
+
+    # 纯内存重放（回放内核只读入参，不访问数据库）
+    steps, verification = _delta_steps_conn(
+        None, rec, events, run_seq0, coop_view)
+
+    # rev 漂移但没有任何新动作帧可追（典型：续局迁移把 rev 顶高，或客户端
+    # 漏过一次同步）：不能只靠旧帧视图对齐，回全量快照恢复一致性
+    rev_drift = (cur_rev is not None and cur_rev != rec["rev"])
+    if rev_drift and not steps:
+        return _sync_response(reset=True, reason="rev_drift",
+                              snapshot=snapshot_now())
+
+    # 增量帧的终态视图：rev 与 seq 一一对应时最后一帧即权威（已带 rev）；
+    # 迁移等打破对应时，帧视图不带可信 rev，改发真实存档构造的权威快照，
+    # 保证客户端局部重放后落的是带正确 rev 的视口（共享状态不漂移）。
+    if steps:
+        snapshot = (steps[-1]["view"]
+                    if steps[-1]["view"].get("rev") == rec["rev"]
+                    else snapshot_now())
+    else:
+        snapshot = None
+    return _sync_response(steps=steps, snapshot=snapshot,
+                          verification=verification,
+                          changed=bool(steps or team_events))
 
 
 # ---------- 协作记账（在 act 的同一事务内调用） ----------
@@ -2856,25 +3038,26 @@ def _legacy_offer_for_accept(run_rec, sku, fixed_chapter, chapters_total, exp_id
 
 
 def replay(run_id):
-    """整局可交互回放。
-
-    从“建局初始状态”开始，按动作日志逐步调用与在线完全相同的纯推演函数
-    （_apply_action，grant_unlocks=False），为每个动作产出一帧：
-      - view：该动作完成后的完整只读视口（地图/战斗/锻造/商店，结构与 /resume 一致）
-      - events：该动作产生的结算事件（战斗动画逐条播放；锻造/交易结果同构）
-      - kind/title/summary：时间轴分组与人类可读描述
-      - result：战斗/整局在本步结束（won/lost/run_won）
-    校验：每步与日志记录的 ckpt 哈希比对；旧日志（无 ckpt/无 ver）标记 legacy
-    并跳过校验。整个回放只读内存与已持久化的日志，不写 runs/battle_events/profile，
-    战败不触发解锁奖励。
-    """
+    """整局可交互回放（对外只读入口）。"""
     rec = load_run(run_id)
     if rec is None:
         raise InvalidAction("run not found")
-    seed = rec["state"]["seed"]
-    map_data = rec["map"]
     # 只读已持久化日志：经共享连接读取，保证读到的都是已提交事务
     events = db.load_events(run_id)
+    return _replay_core(rec, events)
+
+
+def _replay_core(rec, events):
+    """逐帧重放内核：给定 run 记录与已提交动作日志，逐步纯推演并逐位校验。
+
+    整局回放（replay）与协作增量同步（coop_sync 的增量帧）共用这同一条代码
+    路径，保证「断线期间队友提交的动作」在本地重放时与整局回放/在线推演逐帧
+    一致（同一 _apply_action、同一校验点比对、同一 legacy/迁移处理）。
+    全程只读内存与调用方给定的日志，不写 runs/battle_events/profile。
+    """
+    run_id = rec["id"]
+    seed = rec["state"]["seed"]
+    map_data = rec["map"]
 
     # 回放起点：重新构造建局时的初始状态（不读、不写、不迁移真实存档）。
     # 远征章节 run 的起点由 create 事件携带的交接快照（carry）重建，与在线开章一致。
@@ -3176,7 +3359,7 @@ def replay(run_id):
     recorded_versions = sorted(versions)
     current = RULES_VERSION
     final_match = all(c["status"] in ("ok", "legacy") for c in checks)
-    return {
+    result = {
         # 兼容旧客户端：仍返回扁平动作序列与种子
         "run_id": run_id,
         "seed": seed,
@@ -3202,6 +3385,13 @@ def replay(run_id):
         },
         "isolated": True,  # 声明：本次回放无任何存档写入与解锁副作用
     }
+    # 内部携带推演终态与校验上下文（路由返回前剥离，不外泄）：增量同步据此
+    # 切片出「游标之后的新帧」而无需重跑第二遍全量推演。
+    result["_internal"] = {
+        "sim": sim, "map_data": map_data, "checks": checks, "exp_badge": exp_badge,
+        "final_match": final_match,
+    }
+    return result
 
 
 def _step_result(log):
