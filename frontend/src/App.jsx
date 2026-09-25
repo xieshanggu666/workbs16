@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
-import { api } from './api'
+import { api, setCoopCursor } from './api'
 import { useStore } from './store'
+import { useCoopSync } from './coopSync.js'
 import MapView from './components/MapView.jsx'
 import BattleView from './components/BattleView.jsx'
 import RewardView from './components/RewardView.jsx'
@@ -36,6 +37,9 @@ export default function App() {
   const [showCoop, setShowCoop] = useState(false)
   const [coopReplayId, setCoopReplayId] = useState(null)
   const [coopTeamId, setCoopTeamId] = useState('')
+
+  // 协作增量同步（2.10.0）：轮询服务端游标，队友动作逐帧补播 + 断线重连对齐
+  useCoopSync()
 
   useEffect(() => {
     api.cards().then(setCards).catch(() => {})
@@ -142,7 +146,7 @@ export default function App() {
       setRunId(runView.run_id)
       return
     }
-    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口
+    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口，并以权威游标启动增量同步
     setLoading(true); setErr('')
     api.getCoopExpedition(team.id)
       .then((data) => {
@@ -150,6 +154,7 @@ export default function App() {
           applyRun(data.run)
           setRunId(data.run.run_id)
         }
+        if (data.cursor) setCoopCursor(data.cursor)
       })
       .catch((e) => setErr(e.message))
       .finally(() => setLoading(false))

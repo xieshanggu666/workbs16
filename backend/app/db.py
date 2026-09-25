@@ -315,6 +315,17 @@ def append_event_conn(conn, run_id, seq, action, payload):
     )
 
 
+def _decode_payload(raw):
+    """日志行 payload 解码：损坏（NULL/截断/非法 JSON/非对象）降级为 _corrupt。"""
+    try:
+        payload = json.loads(raw) if raw is not None else {}
+    except (ValueError, TypeError):
+        payload = {"_corrupt": True, "_raw": raw[:200] if isinstance(raw, str) else None}
+    if not isinstance(payload, dict):
+        payload = {"_corrupt": True}
+    return payload
+
+
 def load_events(run_id):
     """读取动作日志（只读）。
 
@@ -330,17 +341,24 @@ def load_events(run_id):
             "SELECT seq, action, payload_json FROM battle_events WHERE run_id=? ORDER BY seq",
             (run_id,),
         ).fetchall()
-    out = []
-    for r in rows:
-        raw = r["payload_json"]
-        try:
-            payload = json.loads(raw) if raw is not None else {}
-        except (ValueError, TypeError):
-            payload = {"_corrupt": True, "_raw": raw[:200] if isinstance(raw, str) else None}
-        if not isinstance(payload, dict):
-            payload = {"_corrupt": True}
-        out.append({"seq": r["seq"], "action": r["action"], "payload": payload})
-    return out
+    return [{"seq": r["seq"], "action": r["action"],
+             "payload": _decode_payload(r["payload_json"])} for r in rows]
+
+
+def load_events_since_conn(conn, run_id, since_seq, limit=None):
+    """增量读动作日志（游标之后的行，按 seq 升序）——协作同步（2.10.0）用。
+
+    与 load_events 同构的损坏行降级；limit 由调用方多取一条以判断「落后过多」。
+    """
+    sql = ("SELECT seq, action, payload_json FROM battle_events "
+           "WHERE run_id=? AND seq>? ORDER BY seq")
+    params = [run_id, since_seq]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [{"seq": r["seq"], "action": r["action"],
+             "payload": _decode_payload(r["payload_json"])} for r in rows]
 
 
 # ---------- 行动请求幂等 ----------
@@ -466,17 +484,21 @@ def load_expedition_events(exp_id):
             "SELECT seq, kind, payload_json FROM expedition_events WHERE exp_id=? ORDER BY seq",
             (exp_id,),
         ).fetchall()
-    out = []
-    for r in rows:
-        raw = r["payload_json"]
-        try:
-            payload = json.loads(raw) if raw is not None else {}
-        except (ValueError, TypeError):
-            payload = {"_corrupt": True, "_raw": raw[:200] if isinstance(raw, str) else None}
-        if not isinstance(payload, dict):
-            payload = {"_corrupt": True}
-        out.append({"seq": r["seq"], "kind": r["kind"], "payload": payload})
-    return out
+    return [{"seq": r["seq"], "kind": r["kind"],
+             "payload": _decode_payload(r["payload_json"])} for r in rows]
+
+
+def load_expedition_events_since_conn(conn, exp_id, since_seq, limit=None):
+    """增量读远征事件（游标之后的行）——协作同步（2.10.0）用。"""
+    sql = ("SELECT seq, kind, payload_json FROM expedition_events "
+           "WHERE exp_id=? AND seq>? ORDER BY seq")
+    params = [exp_id, since_seq]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [{"seq": r["seq"], "kind": r["kind"],
+             "payload": _decode_payload(r["payload_json"])} for r in rows]
 
 
 def list_expedition_runs(exp_id):
@@ -680,17 +702,21 @@ def load_coop_events(team_id):
         rows = conn.execute(
             "SELECT seq, kind, payload_json FROM coop_events WHERE team_id=? ORDER BY seq",
             (team_id,)).fetchall()
-    out = []
-    for r in rows:
-        raw = r["payload_json"]
-        try:
-            payload = json.loads(raw) if raw is not None else {}
-        except (ValueError, TypeError):
-            payload = {"_corrupt": True}
-        if not isinstance(payload, dict):
-            payload = {"_corrupt": True}
-        out.append({"seq": r["seq"], "kind": r["kind"], "payload": payload})
-    return out
+    return [{"seq": r["seq"], "kind": r["kind"],
+             "payload": _decode_payload(r["payload_json"])} for r in rows]
+
+
+def load_coop_events_since_conn(conn, team_id, since_seq, limit=None):
+    """增量读队伍时间线（游标之后的行）——协作同步（2.10.0）用。"""
+    sql = ("SELECT seq, kind, payload_json FROM coop_events "
+           "WHERE team_id=? AND seq>? ORDER BY seq")
+    params = [team_id, since_seq]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [{"seq": r["seq"], "kind": r["kind"],
+             "payload": _decode_payload(r["payload_json"])} for r in rows]
 
 
 def next_ledger_seq_conn(conn, team_id):

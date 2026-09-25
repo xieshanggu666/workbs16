@@ -21,6 +21,11 @@
 - 业务校验失败（金币不足/格位非法等）沿用既有事务整体回滚；
 - 章节战败 -> 远征与队伍同事务结算为 lost，已入账的章节通关协作金不追回
   （它们已在通过的章节里落袋），终胜名义奖励不发放。
+
+断线重连与事件增量同步（2.10.0）：动作落库时携带录制帧（结算事件序列），
+协作同步接口按服务端游标（章节 run 动作日志 / 队伍时间线 / 远征事件三条
+日志的已读位置）下发增量；游标错乱、落后过多或遇到无录制帧的旧日志时
+回退全量视口对齐，保证各成员画面与权威共享状态逐帧一致。
 """
 from __future__ import annotations
 
@@ -208,4 +213,56 @@ def coop_badge(team, members, chapter, chapters_total, exp_status, me_id=None):
             "chapter_clear_bonus": CHAPTER_CLEAR_BONUS,
             "final_win_bonus": FINAL_WIN_BONUS,
         },
+    }
+
+
+# ---------- 断线重连与事件增量同步（规则 2.10.0） ----------
+# 单次增量同步返回的动作事件上限：客户端落后超过该值说明长期断线，
+# 直接 reset 全量视口对齐（逐帧补播几百帧动画没有意义）。
+SYNC_ACTION_LIMIT = 64
+
+
+def cursor_public(run_id, run_seq, team_seq, exp_seq, rev=None, chapter=None,
+                  expedition_status=None, run_status=None):
+    """服务端权威游标：客户端下一次增量同步的起点。
+
+    游标四元组 (run_id, run_seq, team_seq, exp_seq) 分别锚定章节 run 动作日志、
+    队伍时间线、远征事件三条日志的已读位置；rev/章节/状态为权威快照锚点，
+    供客户端校验本地视口是否已是最新。
+    """
+    return {
+        "run_id": run_id,
+        "run_seq": run_seq,
+        "team_seq": team_seq,
+        "exp_seq": exp_seq,
+        "rev": rev,
+        "chapter": chapter,
+        "expedition_status": expedition_status,
+        "run_status": run_status,
+    }
+
+
+def sync_action_public(row):
+    """增量动作事件视口：录制帧（结算事件序列）+ 操作者 + 版本锚点。
+
+    2.10.0 起每个动作落库时携带录制帧 log（与在线 /act 响应同源的结算事件
+    序列），增量同步直接读日志行即可逐帧补播，无需服务端重新推演。
+    replay_only=True（2.10.0 之前的旧日志/损坏行没有录制帧）时前端不可局部
+    重放，必须走全量视口对齐。create 事件无状态变化，视为空帧。
+    """
+    p = row.get("payload") or {}
+    corrupt = bool(p.get("_corrupt"))
+    is_create = row.get("action") == "create"
+    log = p.get("log")
+    replay_only = corrupt or (not isinstance(log, list) and not is_create)
+    return {
+        "seq": row.get("seq"),
+        "action": row.get("action"),
+        "actor": p.get("actor"),
+        "actor_role": p.get("actor_role"),
+        "log": log if isinstance(log, list) else ([] if is_create else None),
+        "rev": p.get("rev"),
+        "ckpt": p.get("ckpt"),
+        "ver": p.get("ver"),
+        "replay_only": replay_only,
     }

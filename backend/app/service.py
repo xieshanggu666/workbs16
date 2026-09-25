@@ -79,7 +79,14 @@ from .settlement import EffectEvent, SettlementQueue
 #        战败整队同事务回退为 lost；整程回放时间线叠加队伍事件与每步操作者。
 #        run 状态新增 coop_team（队伍 id；单人远征为 None）进入交接快照，
 #        旧 create 校验点缺该字段，回放候选按 include_coop=False 比对兼容。
-RULES_VERSION = "2.9.0"
+# 2.10.0：协作远征断线重连与事件增量同步——动作落库时 payload 追加录制帧
+#        log（与在线 /act 响应同源的结算事件序列）与提交后 rev，动作日志
+#        本身即逐帧数据源；新增协作同步接口按服务端游标（章节 run 动作日志
+#        seq / 队伍时间线 seq / 远征事件 seq）下发增量，游标错乱、落后过多
+#        或遇到无录制帧的旧日志时回退全量视口（reset）。回放仍以推演为准，
+#        并逐条比对录制帧与推演帧（frame 维度）证明两者一致；录制帧不参与
+#        状态校验点哈希，旧日志无该字段按 replay_only/legacy 兼容。
+RULES_VERSION = "2.10.0"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
 COMPANION_RULES_VERSION = "2.6.0"  # 伙伴字段进入 run 状态：更早日志的迁移步前按 legacy 比对
 BLOCK_RULES_VERSION = "2.7.0"  # 格挡/援护结算顺序修复：更早日志的战斗动作走旧时序重演
@@ -1298,6 +1305,8 @@ def get_coop_expedition(team_id, member_id=None):
 
     注意：resume 自身会开启共享连接事务，不能在外层事务里调用（单连接不可
     嵌套）；这里只在短事务里读队伍/远征索引，事务结束后再 resume 当前章节。
+    响应附带权威游标（2.10.0）：客户端以此作为增量同步的起点，断线重连后
+    无需逐帧补播历史，直接落在最新状态再增量跟随。
     """
     with db.run_lock(f"coop:{team_id}"):
         with db.transaction() as conn:
@@ -1307,16 +1316,145 @@ def get_coop_expedition(team_id, member_id=None):
             if not team.get("expedition_id"):
                 # 尚未开赛：只返回大厅视口
                 return {"team": _team_view_conn(conn, team, me_id=member_id),
-                        "expedition": None, "run": None}
+                        "expedition": None, "run": None,
+                        "cursor": _coop_cursor_conn(conn, team, None, None)}
             exp = db.load_expedition(team["expedition_id"])
             if exp is None:
                 raise InvalidAction("expedition not found")
             current_run_id = exp["current_run_id"]
             team_view = _team_view_conn(conn, team, me_id=member_id)
             expedition_view = _expedition_view(exp)
+            cursor = _coop_cursor_conn(conn, team, exp, current_run_id)
         # 事务已提交：resume 走它自己的迁移事务（coop 摘要在其中构造）
         run_view = resume(current_run_id, member_id=member_id)
-        return {"team": team_view, "expedition": expedition_view, "run": run_view}
+        return {"team": team_view, "expedition": expedition_view, "run": run_view,
+                "cursor": cursor}
+
+
+def _coop_cursor_conn(conn, team, exp, current_run_id):
+    """组装权威游标（须在事务内调用）：三条日志的当前最大 seq + 存档版本锚点。"""
+    team_seq = db.next_coop_seq_conn(conn, team["id"]) - 1
+    if exp is None or current_run_id is None:
+        return coop_mod.cursor_public(None, 0, team_seq, 0,
+                                      expedition_status=None)
+    exp_seq = db.next_expedition_seq_conn(conn, exp["id"]) - 1
+    run_seq = db.next_seq_conn(conn, current_run_id) - 1
+    row = conn.execute("SELECT rev, status FROM runs WHERE id=?",
+                       (current_run_id,)).fetchone()
+    return coop_mod.cursor_public(
+        current_run_id, run_seq, team_seq, exp_seq,
+        rev=row["rev"] if row else None,
+        chapter=exp["chapter"],
+        expedition_status=exp["status"],
+        run_status=row["status"] if row else None)
+
+
+def coop_team_sync(team_id, member_id, run_id=None, run_seq=0, team_seq=0, exp_seq=0):
+    """协作远征增量同步（规则 2.10.0）：服务端游标 + 事件增量下发。
+
+    断线重连/轮询共用这一条通道：
+    - 权限：member_id 必须属于该队（与 act 同一套成员核验），否则 403——
+      事件流包含全体成员的共享状态操作，绝不向队外泄露；
+    - 游标 (run_id, run_seq, team_seq, exp_seq) 锚定三条日志的已读位置，
+      服务端返回游标之后的增量：动作事件（含录制帧 log/操作者/rev/校验点）、
+      队伍时间线、远征事件；
+    - reset=True 并附全量视口：章节已推进（run_id 变了）、游标超前（客户端
+      错乱）、落后超过 SYNC_ACTION_LIMIT（长期断线，逐帧补播无意义）、或增量
+      中存在无录制帧的旧日志/损坏行——前端应整体应用视口而非局部重放；
+    - reset=False 且动作增量非空时附最新权威视口：前端逐帧补播录制帧后一次
+      性对齐（与单人 /act「播动画 -> 应用权威快照」同一节奏）。
+
+    全程只读（旧档迁移与 resume 同路径，属幂等结构升级），不写任何业务状态。
+    """
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = db.load_coop_team_conn(conn, team_id)
+            if team is None:
+                raise InvalidAction("team not found")
+            # 权限边界：任何事件下发之前先核验成员归属（越权 403、零副作用）
+            member = _require_team_member_conn(conn, team_id, member_id)
+            team_seq_now = db.next_coop_seq_conn(conn, team_id) - 1
+            team_events = db.load_coop_events_since_conn(
+                conn, team_id, max(0, int(team_seq or 0)))
+            team_view = _team_view_conn(conn, team, me_id=member["id"]) \
+                if team_events else None
+
+            if team["status"] != "started" or not team.get("expedition_id"):
+                # 未开赛：只有队伍时间线增量（大厅阶段的角色调整/成员进出）
+                return {
+                    "reset": False, "actions": [], "run": None,
+                    "team_events": team_events, "expedition_events": [],
+                    "team": team_view,
+                    "cursor": _coop_cursor_conn(conn, team, None, None),
+                }
+
+            exp = db.load_expedition(team["expedition_id"])
+            if exp is None:
+                raise InvalidAction("expedition not found")
+            current_run_id = exp["current_run_id"]
+            exp_seq_now = db.next_expedition_seq_conn(conn, exp["id"]) - 1
+            exp_events = db.load_expedition_events_since_conn(
+                conn, exp["id"], max(0, int(exp_seq or 0)))
+
+            # 读当前章节 run（旧档迁移与 resume 同路径：幂等结构升级随事务落库）
+            row = conn.execute("SELECT * FROM runs WHERE id=?",
+                               (current_run_id,)).fetchone()
+            if row is None:
+                raise InvalidAction("run not found")
+            state = json.loads(row["state_json"])
+            map_data = json.loads(row["map_json"])
+            rec = {"id": current_run_id, "expedition_id": row["expedition_id"],
+                   "chapter": row["chapter"]}
+            migrated = _migrate_state(state)
+            _ensure_expedition_fields_conn(conn, state, rec)
+            if _repair_expedition_chapter_run_conn(conn, state, rec):
+                migrated = True
+            if migrated:
+                db.save_run_run(conn, current_run_id, row["status"],
+                                row["position"], state)
+            rev_now = row["rev"] + 1 if migrated else row["rev"]
+            run_seq_now = db.next_seq_conn(conn, current_run_id) - 1
+
+            # ---------- 判定增量 / 全量 ----------
+            actions = []
+            reset = False
+            if run_id != current_run_id:
+                reset = True  # 章节推进/首次进入：客户端锚定的不是当前章节 run
+            else:
+                since = max(0, int(run_seq or 0))
+                if since > run_seq_now:
+                    reset = True  # 游标超前：客户端状态错乱，必须全量对齐
+                else:
+                    actions = db.load_events_since_conn(
+                        conn, current_run_id, since,
+                        limit=coop_mod.SYNC_ACTION_LIMIT + 1)
+                    if len(actions) > coop_mod.SYNC_ACTION_LIMIT:
+                        reset = True  # 落后过多（长期断线）：逐帧补播无意义
+                        actions = []
+                    elif any(coop_mod.sync_action_public(a)["replay_only"]
+                             for a in actions):
+                        reset = True  # 旧日志/损坏行无录制帧：不可局部重放
+                        actions = []
+
+            cursor = coop_mod.cursor_public(
+                current_run_id, run_seq_now, team_seq_now, exp_seq_now,
+                rev=rev_now, chapter=exp["chapter"],
+                expedition_status=exp["status"], run_status=state["status"])
+            run_view = None
+            if reset or actions:
+                exp_badge = _exp_badge(exp)
+                coop_view = _coop_badge_conn(conn, team, me_id=member["id"])
+                run_view = _public_view(state, map_data, current_run_id, rev=rev_now,
+                                        expedition=exp_badge, coop=coop_view)
+            return {
+                "reset": reset,
+                "actions": [coop_mod.sync_action_public(a) for a in actions],
+                "run": run_view,
+                "team_events": team_events,
+                "expedition_events": exp_events,
+                "team": team_view,
+                "cursor": cursor,
+            }
 
 
 # ---------- 协作记账（在 act 的同一事务内调用） ----------
@@ -1644,6 +1782,11 @@ def act(run_id, action, member_id=None):
                 # 2.9.0：协作远征每步记录操作者（单人远征为 None），供整程回放标注
                 "actor": coop_member["id"] if coop_member else None,
                 "actor_role": coop_member["role"] if coop_member else None,
+                # 2.10.0：录制帧（本动作的结算事件序列，与响应 log 同源）与提交后
+                # rev——动作日志本身即增量同步的逐帧数据源；不参与状态校验点哈希，
+                # 回放仍按推演重建并逐条比对录制帧（frame 维度）。
+                "log": log,
+                "rev": rec["rev"] + 1,
                 "ver": RULES_VERSION, "ckpt": state_checkpoint(run),
             }
             if migrated:
@@ -2716,6 +2859,18 @@ _CKPT_SKIP_KEYS = {
 }
 
 
+def _frames_equal(recorded_log, replayed_log):
+    """录制帧与推演帧逐条比对（JSON 规范化后比较，与键序无关）。
+
+    2.10.0 起动作日志携带录制帧（在线 /act 的结算事件序列）；回放推演同一
+    动作后比对两者，可检出「录制与推演分叉」类的规则漂移。两者都由同一代码
+    路径产出且经 JSON 序列化往返，规范化后应逐位相等。
+    """
+    def norm(x):
+        return json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return norm(recorded_log) == norm(replayed_log)
+
+
 def state_checkpoint(run, include_companion=True, include_potions=True,
                      include_encounters=True, include_coop=True):
     """权威状态校验点：对完整 run 状态取稳定哈希（SHA-256 截断 16 位）。
@@ -2962,6 +3117,10 @@ def replay(run_id):
 
     for ev in events:
         payload = ev.get("payload") or {}
+        # 2.10.0 录制帧（在线 /act 的结算事件序列）：就地取出，不参与推演参数
+        # 与校验点；推演完成后逐条比对（frame 维度）。就地 pop 也让回放响应的
+        # 兼容字段 actions 不重复携带帧数据（steps[].events 已覆盖）。
+        frame_log = payload.pop("log", None)
         corrupt_row = bool(payload.get("_corrupt"))
         # 旧档迁移步：状态从旧结构迁到新结构，与回放起点（已为新结构）的校验点
         # 天然不可逐位比较。正常推演但本步跳过哈希校验，按 legacy 呈现。
@@ -3138,6 +3297,15 @@ def replay(run_id):
             include_encounters=not pre_enc_step,
             include_coop=not pre_coop_step,
         )
+        # 2.10.0 录制帧比对：该步落库时录制了结算事件序列且本次推演成功，
+        # 逐条比对录制帧与推演帧——状态校验点背书「结果一致」，帧比对背书
+        # 「过程逐帧一致」（增量同步/断线重连补播的正是录制帧）。
+        frame_check = None
+        if isinstance(frame_log, list) and a != "create":
+            if error:
+                frame_check = "error"
+            else:
+                frame_check = "ok" if _frames_equal(frame_log, log) else "mismatch"
         if error:
             status = "error"
         elif not recorded:
@@ -3147,7 +3315,8 @@ def replay(run_id):
         else:
             status = "mismatch"
         checks.append({"seq": ev["seq"], "action": a, "status": status,
-                       "recorded": recorded, "actual": actual})
+                       "recorded": recorded, "actual": actual,
+                       "frame": frame_check})
 
         # 事件与在线 /act 返回的 log 同构（含 snapshot 校正点），前端播放器可复用
         # 同一套结算事件驱动；帧 view 本身已携带权威状态，跳转时直接落帧无需放动画。
@@ -3164,6 +3333,7 @@ def replay(run_id):
             "view": _public_view(sim, map_data, run_id, include_unlocks=False,
                                  expedition=exp_badge),
             "check": status,
+            "frame": frame_check,
             "legacy": (is_legacy or migrated_step or pre_repair
                        or create_of_legacy or pre_companion_step or pre_potions_step
                        or pre_block_step or pre_enc_step or pre_coop_step),
@@ -3175,7 +3345,8 @@ def replay(run_id):
 
     recorded_versions = sorted(versions)
     current = RULES_VERSION
-    final_match = all(c["status"] in ("ok", "legacy") for c in checks)
+    final_match = all(c["status"] in ("ok", "legacy") for c in checks) and \
+        all(c.get("frame") in (None, "ok") for c in checks)
     return {
         # 兼容旧客户端：仍返回扁平动作序列与种子
         "run_id": run_id,
@@ -3195,6 +3366,7 @@ def replay(run_id):
             "repaired": repaired_steps,
             "mismatch": sum(c["status"] == "mismatch" for c in checks),
             "error": sum(c["status"] == "error" for c in checks),
+            "frame_mismatch": sum(c.get("frame") == "mismatch" for c in checks),
             "seq_gaps": gap_steps,
             "final_match": final_match,
             "checks": checks,

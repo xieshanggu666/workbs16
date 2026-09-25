@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
-import { bus } from '../phaser/battleBus'
+import { bus, playBattleLog } from '../phaser/battleBus'
 import { startPhaser, STATUS_ZH } from '../phaser/BattleScene.js'
 import { growthNodesOf, growthTag } from '../growth'
 import PotionBelt from './PotionBelt.jsx'
@@ -17,6 +17,9 @@ export default function BattleView({ view }) {
   const runId = useStore((s) => s.runId)
   const applyRun = useStore((s) => s.applyRun)
   const cardMeta = useStore((s) => s.cardMeta)
+  // 协作同步（2.10.0）：补播队友动作期间本地操作暂时禁用
+  const syncing = useStore((s) => s.syncing)
+  const setActing = useStore((s) => s.setActing)
   const [err, setErr] = useState('')
 
   useEffect(() => {
@@ -39,28 +42,11 @@ export default function BattleView({ view }) {
   }, [view.battle, view])
 
   // 把服务端结算日志交给 Phaser 按顺序播放；resolve 时表示整条连锁已播完
-  function playLog(entries) {
-    return new Promise((resolve) => {
-      const list = (entries || []).filter(Boolean)
-      if (!list.length) return resolve()
-      let settled = false
-      const finish = () => {
-        if (settled) return
-        settled = true
-        off()
-        clearTimeout(timer)
-        resolve()
-      }
-      const off = bus.on('queue_done', finish)
-      // 兜底：动画异常也不能让操作永久锁死
-      const timer = setTimeout(finish, 15000)
-      bus.emit('queue', list)
-    })
-  }
+  const playLog = playBattleLog
 
   async function doAct(action, extra = {}) {
-    if (busy) return
-    setBusy(true); setErr('')
+    if (busy || syncing) return
+    setBusy(true); setActing(true); setErr('')
     try {
       const res = await api.act(runId, { action, ...extra })
       const entries = res.log || []
@@ -72,13 +58,13 @@ export default function BattleView({ view }) {
     } catch (e) {
       setErr(await handleActError(e, runId, applyRun))
     } finally {
-      setBusy(false)
+      setBusy(false); setActing(false)
     }
   }
 
   async function usePotion(slot) {
-    if (busy) return
-    setBusy(true); setErr('')
+    if (busy || syncing) return
+    setBusy(true); setActing(true); setErr('')
     try {
       const res = await api.act(runId, { action: 'use_potion', slot })
       const entries = res.log || []
@@ -89,7 +75,7 @@ export default function BattleView({ view }) {
     } catch (e) {
       setErr(await handleActError(e, runId, applyRun))
     } finally {
-      setBusy(false)
+      setBusy(false); setActing(false)
     }
   }
 
@@ -111,7 +97,7 @@ export default function BattleView({ view }) {
   }
 
   function canPlay(hc) {
-    return inTurn && hc.cost <= energy && busy === false && battleAllowed
+    return inTurn && hc.cost <= energy && busy === false && !syncing && battleAllowed
   }
 
   const battleAllowed = canDoBattle(view)
@@ -159,8 +145,9 @@ export default function BattleView({ view }) {
           })}
         </div>
         {busy && <span className="hint settling">结算中…</span>}
+        {syncing && !busy && <span className="hint settling">同步队友动作…</span>}
         <button className="primary" onClick={() => doAct('end_turn')}
-                disabled={!inTurn || busy || !battleAllowed}
+                disabled={!inTurn || busy || syncing || !battleAllowed}
                 title={!battleAllowed ? battleDeny : undefined}>
           结束回合
         </button>

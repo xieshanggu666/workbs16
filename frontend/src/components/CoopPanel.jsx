@@ -10,6 +10,8 @@ const ROLE_NAME = { leader: '队长', combat: '战斗位', supply: '资源位' }
 export default function CoopPanel() {
   const view = useStore((s) => s.view)
   const runId = useStore((s) => s.runId)
+  const syncing = useStore((s) => s.syncing)
+  const coopFeed = useStore((s) => s.coopFeed)
   const [team, setTeam] = useState(null)
   const [err, setErr] = useState('')
   const timer = useRef(null)
@@ -82,6 +84,16 @@ export default function CoopPanel() {
         入队码 <b className="coop-code-inline">{coop.code}</b> ·
         通关协作金 {coop.rewards.chapter_clear_bonus} 金入共享池随章节继承
       </p>
+      <p className={`coop-sync-state ${syncing ? 'busy' : ''}`}>
+        {syncing ? '🔄 正在同步队友动作…' : '🟢 实时同步中（队友操作自动补播）'}
+      </p>
+      {coopFeed.length > 0 && (
+        <ul className="coop-feed">
+          {coopFeed.slice(0, 6).map((f) => (
+            <li key={f.key}>{f.text}</li>
+          ))}
+        </ul>
+      )}
       {err && <div className="error">{err}</div>}
     </div>
   )

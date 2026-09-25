@@ -1,5 +1,8 @@
 const BASE = '/api'
 
+// store 只依赖 zustand，与本模块无循环依赖；用于冲突恢复时触发协作同步器
+import { useStore } from './store'
+
 // 行动请求并发控制：
 // - expectedRev：当前视口的存档版本号，服务端据此拒绝基于过期状态的提交（409 状态冲突）
 // - 每个新意图生成 request_id 做请求级幂等；网络超时后的同一重试复用同一 id，
@@ -9,6 +12,27 @@ let expectedRev = null
 // 多人协作远征（2.9.0）：当前队伍成员身份（入会响应里的 me.id）。协作章节 run
 // 的每个动作都带 member_id，服务端据此做角色权限边界（越权 403、零副作用）。
 let currentMemberId = null
+
+// 协作增量同步（2.10.0）：客户端游标，锚定三条日志的已读位置
+// （章节 run 动作日志 run_seq / 队伍时间线 team_seq / 远征事件 exp_seq）。
+// 由全量入口（getCoopExpedition）初始化、sync 响应持续推进；页面刷新后丢失，
+// 首次同步走 reset 全量对齐——与断线重连同一条路径。
+let coopCursor = null
+
+export function getCoopCursor() {
+  return coopCursor
+}
+
+export function setCoopCursor(cursor) {
+  coopCursor = cursor ? { ...cursor } : null
+}
+
+// 本地动作已提交且动画已播放：推进游标，避免同步通道把自己的操作再播一遍
+export function noteLocalActSeq(runId, seq) {
+  if (coopCursor && coopCursor.run_id === runId && Number.isInteger(seq)) {
+    coopCursor = { ...coopCursor, run_seq: Math.max(coopCursor.run_seq, seq) }
+  }
+}
 
 export function setExpectedRev(rev) {
   if (Number.isInteger(rev)) expectedRev = rev
@@ -111,6 +135,8 @@ export const api = {
     try {
       const data = await j(`${BASE}/runs/${id}/act`, { method: 'POST', body: JSON.stringify(body) })
       if (Number.isInteger(data.rev)) expectedRev = data.rev
+      // 协作同步：自己的动作已随响应播放，推进游标避免同步通道重复补播
+      noteLocalActSeq(id, data.seq)
       return data
     } catch (e) {
       // 状态冲突：版本号已失效，清掉避免后续请求继续带旧值；调用方应刷新续局
@@ -163,22 +189,52 @@ export const api = {
     j(`${BASE}/coop/teams/${teamId}/start`, {
       method: 'POST',
       body: JSON.stringify({ member_id: currentMemberId, request_id: retryKey || newRequestId() }),
+    }).then((data) => {
+      if (Number.isInteger(data?.run?.rev)) setExpectedRev(data.run.rev)
+      return data
     }),
   advanceCoopExpedition: (teamId, { retryKey } = {}) =>
     j(`${BASE}/coop/teams/${teamId}/advance`, {
       method: 'POST',
       body: JSON.stringify({ member_id: currentMemberId, request_id: retryKey || newRequestId() }),
+    }).then((data) => {
+      if (Number.isInteger(data?.run?.rev)) setExpectedRev(data.run.rev)
+      return data
     }),
   getCoopExpedition: (teamId, memberId = currentMemberId) =>
-    j(`${BASE}/coop/teams/${teamId}/expedition${memberId ? `?member_id=${encodeURIComponent(memberId)}` : ''}`),
+    j(`${BASE}/coop/teams/${teamId}/expedition${memberId ? `?member_id=${encodeURIComponent(memberId)}` : ''}`)
+      .then((data) => {
+        if (Number.isInteger(data?.run?.rev)) setExpectedRev(data.run.rev)
+        return data
+      }),
+  // 增量同步（2.10.0）：带客户端游标，服务端返回三条日志的增量事件；
+  // 游标缺失/错乱/落后过多时 reset 全量视口（断线重连同路径）
+  syncCoop: (teamId, cursor = coopCursor) => {
+    const q = new URLSearchParams()
+    if (currentMemberId) q.set('member_id', currentMemberId)
+    if (cursor?.run_id) q.set('run_id', cursor.run_id)
+    q.set('run_seq', cursor?.run_seq ?? 0)
+    q.set('team_seq', cursor?.team_seq ?? 0)
+    q.set('exp_seq', cursor?.exp_seq ?? 0)
+    return j(`${BASE}/coop/teams/${teamId}/sync?${q.toString()}`)
+  },
   coopTeamReplay: (teamId) => j(`${BASE}/coop/teams/${teamId}/replay`),
 }
 
 // 统一的行动错误处理：遇到 409（重复请求/状态冲突）自动拉取最新视口对齐，
 // 返回可展示给用户的提示语。refresh 为最新视口应用函数（通常是 applyRun）。
+// 协作远征（2.10.0）：优先走增量同步追平——局部重放队友在此期间的动作，
+// 不打断当前画面；同步器不可用（非协作局）才回退全量刷新。
 // 403（协作权限边界）不刷新——刷新不会改变角色授权，直接把原因返回给调用方。
 export async function handleActError(e, runId, refresh) {
   if (e instanceof ConflictError) {
+    try {
+      const syncNow = useStore.getState().coopSyncNow
+      if (syncNow) {
+        await syncNow()
+        return '操作与最新状态冲突，已同步队友最新进度，请重试'
+      }
+    } catch (_) { /* 同步失败则回退全量刷新 */ }
     try {
       const fresh = await api.resume(runId)
       if (refresh) refresh(fresh)

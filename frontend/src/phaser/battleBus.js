@@ -20,3 +20,25 @@ export const bus = {
     _listeners.clear()
   },
 }
+
+// 把一串结算事件交给 Phaser 按顺序播放；resolve 时整条连锁已播完。
+// 本地动作（BattleView）与协作增量同步（coopSync）共用同一套播放，
+// 保证「自己操作」与「队友操作补播」的逐帧表现一致。超时兜底防止动画
+// 异常让操作永久锁死。
+export function playBattleLog(entries, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const list = (entries || []).filter(Boolean)
+    if (!list.length) return resolve()
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      off()
+      clearTimeout(timer)
+      resolve()
+    }
+    const off = bus.on('queue_done', finish)
+    const timer = setTimeout(finish, timeoutMs)
+    bus.emit('queue', list)
+  })
+}

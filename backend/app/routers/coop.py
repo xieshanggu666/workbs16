@@ -105,6 +105,23 @@ def get_team_expedition(team_id: str, member_id: str | None = None):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/teams/{team_id}/sync")
+def sync_team(team_id: str, member_id: str | None = None, run_id: str | None = None,
+              run_seq: int = 0, team_seq: int = 0, exp_seq: int = 0):
+    """断线重连与事件增量同步（2.10.0）：按客户端游标返回三条日志的增量。
+
+    权限边界与写动作同源：member_id 必须属于该队（越权 403、零副作用）。
+    """
+    try:
+        return service.coop_team_sync(team_id, member_id, run_id=run_id,
+                                      run_seq=run_seq, team_seq=team_seq,
+                                      exp_seq=exp_seq)
+    except service.PermissionDenied as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except service.InvalidAction as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/teams/{team_id}/replay")
 def team_replay(team_id: str):
     try:
